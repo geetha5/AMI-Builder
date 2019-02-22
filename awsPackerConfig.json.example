@@ -1,0 +1,11 @@
+{
+    "awsProfile": "<awsProfile>",
+    "region": "<region>", //OPTIONAL
+    "instanceType": "<instanceType>", //OPTIONAL
+    "baseAmi": "<baseAmi>",
+    "vpcId": "<vpcId>",
+    "subnetId": "<subnetId>",
+    "securityGroupId": "<securityGroupId>",
+    "sshKeyPair": "<sshKeyPair>",
+    "iamInstanceProfile": "<iamInstanceProfile>"
+}

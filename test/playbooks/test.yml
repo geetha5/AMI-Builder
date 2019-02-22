@@ -1,0 +1,13 @@
+---
+
+- name:
+  hosts: localhost
+  become: yes
+  become_user: root
+  vars_files:
+    - /vagrant/test/variables/test_variables.yml
+
+  roles:
+    - base
+    - trendmicro
+    - jdk

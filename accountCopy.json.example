@@ -1,0 +1,13 @@
+{
+    "awsRegion": "<ami-region>",
+    "accounts": [
+        {
+            "accountName": "<account_name>",
+            "accountNumber": "<account_number>",
+            "profileName": "<credential profile name>",
+            "buildAccount": "<true if this is the account using to build, false otherwise>",
+            "KeyId": "<the KMS Key id for EBS encryption>"
+        }
+        ... more accounts
+    ]
+}

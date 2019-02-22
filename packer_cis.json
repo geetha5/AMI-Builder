@@ -1,0 +1,85 @@
+{
+  "variables": {
+    "awsProfile": "none",
+    "region": "us-east-1",
+    "instanceType": "t2.micro",
+    "baseAmi": "",
+    "vpcId": "",
+    "subnetId": "",
+    "securityGroupId": "",
+    "sshKeyPair": "",
+    "iamInstanceProfile": ""
+  },
+  "builders": [
+    {
+      "name": "cis-image_profileCredentials",
+      "type": "amazon-ebs",
+      "ami_name": "WEX Amazon Linux CIS Temp {{ timestamp }}",
+      "ami_description": "WEX Amazon Linux CIS Temp",
+      "profile": "{{user `awsProfile`}}",
+      "region": "{{user `region`}}",
+      "instance_type": "{{user `instanceType`}}",
+      "source_ami": "{{user `baseAmi`}}",
+      "ami_virtualization_type": "hvm",
+      "ssh_username": "ec2-user",
+      "ssh_keypair_name": "{{user `sshKeyPair`}}",
+      "ssh_private_key_file": "{{user `sshKeyPairFile`}}",
+      "vpc_id": "{{user `vpcId`}}",
+      "subnet_id": "{{user `subnetId`}}",
+      "security_group_id": "{{user `securityGroupId`}}",
+      "iam_instance_profile": "{{user `iamInstanceProfile`}}",
+      "ami_block_device_mappings": [
+        {
+          "device_name": "/dev/xvda",
+          "volume_type": "gp2",
+          "volume_size": 8,
+          "delete_on_termination": true
+        }
+      ]
+    }
+  ],
+  "provisioners": [
+    {
+      "type": "shell",
+      "script": "scripts/install_ansible.sh",
+      "execute_command": "chmod +x {{ .Path }}; {{ .Vars }} sudo -E sh {{ .Path }}"
+    },
+    {
+      "type": "file",
+      "source": "ansible/ansible.cfg",
+      "destination": "/tmp/ansible.cfg"
+    },
+    {
+      "type": "file",
+      "source": "ansible/cis_playbook.yml",
+      "destination": "/tmp/cis_playbook.yml"
+    },
+    {
+      "type": "file",
+      "source": "ansible/roles/anthcourtney.cis-amazon-linux",
+      "destination": "/tmp"
+    },
+    {
+      "type": "shell",
+      "script": "scripts/deploy_cis_ansible.sh",
+      "execute_command": "chmod +x {{ .Path }}; {{ .Vars }} sudo -E sh {{ .Path }}"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "sudo /usr/local/bin/ansible-playbook /etc/ansible/cis_playbook.yml"
+      ]
+    },
+    {
+      "type": "shell",
+      "script": "scripts/cleanup_cis_ansible.sh",
+      "execute_command": "chmod +x {{ .Path }}; {{ .Vars }} sudo -E sh {{ .Path }}"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "sudo rm -rf /tmp/*"
+      ]
+    }
+  ]
+}

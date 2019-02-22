@@ -1,0 +1,15 @@
+// all fields required
+{
+    "aws": {
+        "profile": "credProfile",
+        "ami": "<ami-id>",
+        "instanceType": "t2.micro",
+        "subnetId": "<subnet-id>",
+        "keypair": "<keypair-name>",
+        "region": "us-east-1",
+        "securityGroup": [
+            "<sg-id>"
+        ]
+    },
+    "sshKeyPath": "path to ssh key"
+}

@@ -1,0 +1,11 @@
+gradle.properties
+.vagrant
+.idea
+.gradle
+awsVagrantConfig.json
+awsPackerConfig.json
+accountCopy.json
+test/variables
+ansible/roles/anthcourtney.cis-amazon-linux
+test/output
+test/logs

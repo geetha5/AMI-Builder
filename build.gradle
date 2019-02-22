@@ -1,0 +1,646 @@
+import com.amazonaws.auth.*
+import com.amazonaws.auth.profile.ProfileCredentialsProvider
+import com.amazonaws.services.ec2.AmazonEC2
+import com.amazonaws.services.ec2.AmazonEC2ClientBuilder
+import com.amazonaws.services.ec2.model.*
+import groovy.json.JsonSlurper
+import com.bmuschko.gradle.vagrant.tasks.VagrantUp
+import com.bmuschko.gradle.vagrant.tasks.VagrantDestroy
+import com.bmuschko.gradle.vagrant.tasks.VagrantSsh
+import org.apache.tools.ant.util.LineOrientedOutputStream
+
+buildscript {
+    ext {
+        snakeYamlVersion = '1.17'
+        awsVersion = '1.11.209'
+    }
+    repositories {
+        jcenter()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.bmuschko:gradle-vagrant-plugin:2.1'
+        classpath "com.amazonaws:aws-java-sdk-core:${awsVersion}"
+        classpath "com.amazonaws:aws-java-sdk-ec2:${awsVersion}"
+    }
+}
+
+plugins {
+    id 'org.ajoberstar.grgit' version '2.0.1'
+}
+
+ext {
+    configFile = project.hasProperty('configFile') ? project.property('configFile') : "none"
+
+    // Git Variables //
+    // gitUri - The git repo uri
+    gitUri = loadStringProp("gitUri", "https://github.com/anthcourtney/ansible-role-cis-amazon-linux.git")
+    // gitVersioning - The version tag in git
+    gitVersionTag = loadStringProp("gitVersionTag", "none")
+    // gitBranch - The branch of code to use
+    gitBranch = loadStringProp("gitbranch", "master")
+
+    // local Variables //
+    localRoleDir = loadStringProp("localRoleDir", "none")
+
+    // Test Variables //
+    // ansibleS3Url - The s3 bucket to pull test ansible roles from
+    ansibleS3Url = loadStringProp("s3Bucket", "s3://wex-mobile-devops/ansible/dev/0.0.1_20171115-143338/ansible_roles.zip")
+    // s3Region - The region for s3
+    s3Region = loadStringProp("s3Region", "us-east-1")
+    // testPlaybookName - they name of the test playbook to run
+    testPlaybookName = loadStringProp("testPlaybookName", "test")
+    // cisCatS3Url - The s3 url of the CIS-CAT tools to run the benchmark
+    //                  set to none to bypass
+    cisCatS3Url = loadStringProp("cisCatS3Url", "s3://wex-mobile-devops/tools/ciscat-full-bundle-2018-01-18-v3.0.45.zip")
+    // OS Type and Version
+    osTypeAndVersion = loadStringProp("osTypeAndVersion", "Amazon Linux 1")
+}
+
+// Common Tasks //
+task clean(type:Task) {
+    description = "Removes any build, temp or cis role directory"
+    group = "Common"
+
+    doLast {
+        new File("build").deleteDir()
+        new File("temp").deleteDir()
+        new File("test/output").deleteDir()
+        new File("ansible/roles/anthcourtney.cis-amazon-linux").deleteDir()
+    }
+}
+
+// Dependency Tasks //
+task cleanCheckout(type:Task) {
+    description = "Removes the checked out code for CIS role"
+    group "Dependencies"
+
+    doLast {
+        new File("ansible/roles/anthcourtney.cis-amazon-linux").deleteDir()
+    }
+}
+
+task createRoleDir(type:Task) {
+    description = "creates the ansible roles directory if it doesn't exist"
+    group = "Dependencies"
+
+    doLast {
+        new File("ansible/roles").mkdirs()
+    }
+}
+
+task copyLocalCisRole(type:Task) {
+    description = "Copies the CIS role from a local directory"
+    group = "Dependencies"
+
+    dependsOn 'cleanCheckout'
+    dependsOn 'createRoleDir'
+
+    doLast {
+        if (localRoleDir != "none") {
+            copy {
+                from localRoleDir
+                into "ansible/roles/anthcourtney.cis-amazon-linux"
+                exclude ".idea", ".travis.yml"
+            }
+        }
+        else {
+            throw new GradleException("You must provide a localRoleDir")
+        }
+    }
+}
+
+task pullUpdateCisRole(type:Task) {
+    description = "Clones the CIS role from deisred repo and at deisred ref (branch or tag)"
+    group = "Dependencies"
+
+    dependsOn 'cleanCheckout'
+
+    doLast {
+
+        File roleDir = new File("ansible/roles/anthcourtney.cis-amazon-linux")
+        String checkoutRef
+
+        logger.debug("Cis role dirrectory does not exist doing a clone")
+
+        if (gitVersionTag != "none") {
+            logger.debug("gitVersionTag provided pulling tag ${gitVersionTag}")
+            checkoutRef = gitVersionTag
+        }
+        else if (gitVersionTag == "none" && gitBranch != "master") {
+            logger.debug("no gitVersionTag provided pulling branch ${gitBranch}")
+            checkoutRef = gitBranch
+        }
+        else {
+            logger.debug("cloning HEAD no branch or tag provided")
+            checkoutRef = null
+        }
+
+        grgit.clone() {
+            dir = roleDir.getPath()
+            uri = gitUri
+            remote = "origin"
+            bare = false
+            refToCheckout = checkoutRef
+        }
+    }
+}
+
+// dependency aggregate tasks //
+task resyncLocalCisRole(type:Task) {
+    description = "cleans and recopies a local CIS role directory"
+    group = "Dependencies"
+
+    dependsOn 'cleanCheckout'
+    dependsOn 'copyLocalCisRole'
+
+    copyLocalCisRole.mustRunAfter cleanCheckout
+}
+
+// Test Tasks //
+task createTestSystem(type:VagrantUp) {
+    description = "Creates an AWS test machine"
+    group = "Test"
+    boxDir = file('.')
+    provider = "aws"
+}
+
+task destroyTestSystem(type:VagrantDestroy) {
+    description = "Removes the AWS test machine"
+    group = "Test"
+    boxDir = file('.')
+}
+
+task runCisProvision(type:VagrantSsh) {
+    description = "Runs the CIS playbook on the test machine"
+    group = "Test"
+
+    dependsOn 'createTestSystem'
+
+    boxDir = file('.')
+    sshCommand = "sudo ansible-playbook /etc/ansible/cis_playbook.yml"
+}
+
+task deployTestRoles(type:VagrantSsh) {
+    description "Pulls the test ansible roles from s3 and deploys them"
+    group "Test"
+
+    dependsOn 'createTestSystem'
+
+    boxDir = file('.')
+    sshCommand = "sudo chmod 700 /vagrant/test/scripts/deploy_test_roles.sh && " +
+            "sudo /vagrant/test/scripts/deploy_test_roles.sh ${ansibleS3Url} ${s3Region}"
+}
+
+task runProvisionTest(type:VagrantSsh) {
+    description = "Runs the desired test playbook to test provisioning"
+    group = "Test"
+
+    dependsOn 'createTestSystem'
+
+    boxDir = file('.')
+    sshCommand = "sudo ansible-playbook /vagrant/test/playbooks/${testPlaybookName}.yml"
+}
+
+task deployCisBenchmark(type:VagrantSsh) {
+    description = "Deploys the CIS benchmark"
+    group = "Test"
+
+    dependsOn 'createTestSystem'
+
+    boxDir = file('.')
+    sshCommand = "sudo chmod 700 /vagrant/test/scripts/deploy_cis_cat.sh && " +
+            "sudo /vagrant/test/scripts/deploy_cis_cat.sh ${cisCatS3Url} ${s3Region}"
+}
+
+task runCisBenchmark(type:VagrantSsh) {
+    description = "Runs the CIS benchmark tool on the test vagrant machine"
+    group = "Test"
+
+    dependsOn 'createTestSystem'
+
+    boxDir = file('.')
+    sshCommand = "sudo chmod 700 /vagrant/test/scripts/run_cis_cat.sh && " +
+            "sudo /vagrant/test/scripts/run_cis_cat.sh"
+
+    doLast {
+        File outputsDir = new File('test/output')
+
+        if (outputsDir.exists()) {
+            outputsDir.deleteDir()
+        }
+
+        outputsDir.mkdir()
+        exec {
+            commandLine "vagrant", "scp", ":cis_results/*", "${outputsDir}/"
+        }
+    }
+}
+
+// test aggregate tasks //
+task deployAllTests(type:Task) {
+    description = "Runs both the deployCisBenchmark and deployTestRoles"
+    group = "Test"
+
+    dependsOn 'deployTestRoles'
+    dependsOn 'deployCisBenchmark'
+
+    deployCisBenchmark.mustRunAfter deployTestRoles
+}
+
+task runFullTest(type:Task) {
+    description = "This will run the full test"
+    group = "Test"
+
+    dependsOn 'createTestSystem'
+    dependsOn 'runCisProvision'
+    dependsOn 'deployTestRoles'
+    dependsOn 'deployCisBenchmark'
+    dependsOn 'runProvisionTest'
+    dependsOn 'runCisBenchmark'
+
+    runCisProvision.mustRunAfter createTestSystem
+    deployTestRoles.mustRunAfter runCisProvision
+    deployCisBenchmark.mustRunAfter deployTestRoles
+    runProvisionTest.mustRunAfter deployCisBenchmark
+    runCisBenchmark.mustRunAfter runProvisionTest
+}
+
+// Build Tasks //
+task build(type:Task) {
+    description = "Runs the packer build"
+    group = "Build"
+
+    doLast {
+        String buildTimestamp = new Date().format("yyyyMMdd-HHmmss", TimeZone.getTimeZone("UTC"))
+
+        List<String> buildCmd = [
+                'bash',
+                '-c',
+                "packer build -var-file=awsPackerConfig.json packer_cis.json"
+        ]
+
+        ArrayList<String> outLines = new ArrayList<String>()
+        ArrayList<String> errLines = new ArrayList<String>()
+
+        Process p = buildCmd.execute()
+        def outThread = p.consumeProcessOutputStream(new LineOutput(prefix: "out", lines: outLines))
+        def errThread = p.consumeProcessErrorStream(new LineOutput(prefix: "err", lines: errLines))
+        p.waitFor()
+
+        if (p.exitValue() != 0) {
+            throw new GradleException("There was an error running Ami Build")
+        }
+
+        // debug the output array
+        int outputIndex = 0
+        for (line in outLines) {
+            logger.debug("output array index: ${outputIndex} line: ${line}")
+            outputIndex++
+        }
+        logger.debug("Size of output array: ${outLines.size()}")
+
+        // get ami id from build output
+        String buildInfoLine = outLines.get(outLines.size() - 2)
+        logger.debug("output line with ami information: ${buildInfoLine}")
+        String amiId = (buildInfoLine =~ /ami-\w+$/)[0]
+        logger.debug("grepped Ami id: ${amiId}")
+
+        // get json from accountCopy.json config file
+        Object json = new JsonSlurper().parseText(new File("accountCopy.json").text)
+
+        // get the profile name for the build account
+        String buildAccountProfile = getBuildAccountProfile(json)
+
+        // get the snapshot id of the ami
+        String amiSnapshotId = getSnapshotId(amiId, buildAccountProfile, json.awsRegion)
+
+        // share the ami
+        shareAmi(amiId, json, buildAccountProfile)
+
+        // update the snapshot permissions
+        grantCreateVolumePerms(amiSnapshotId, json, buildAccountProfile)
+
+        // create the final image name
+        String amiName = "WEX CIS ${osTypeAndVersion} (encrypted) ${buildTimestamp}"
+
+        // Copy and encrypt the Ami to all accounts
+        copyAndEncryptAmi(amiId, json, amiName)
+
+        // clean up temp Ami
+        cleanupUnencryptedAmi(amiId, buildAccountProfile, json)
+    }
+}
+
+// Helper Functions //
+/**
+ * This will load a boolean property from a json file if it is set and then
+ * from the typical gradle property source and then a default
+ * @param propertyName the name of the property in the config or prop file
+ * @param defaultValue the supplied default
+ * @return the property value from one of the option sources
+ */
+boolean loadBooleanProp(String propertyName, boolean defaultValue) {
+
+    logger.debug("configFile is ${configFile}")
+    // if the configFile is present check there first
+    if (configFile != "none") {
+        logger.debug("JSON config file is present checking for property ${propertyName}")
+        Object json = new JsonSlurper().parseText(new File(configFile).text)
+        if (json.KeySet().contains(propertyName)) {
+            logger.debug("Property: ${propertyName} found in JSON config file, setting to value")
+            return json[propertyName]
+        }
+        else {
+            logger.debug("Property: ${propertyName} not found in config checking properties of returning defualt")
+            boolean value = project.hasProperty(propertyName) ? project.property(propertyName).toBoolean() : defaultValue
+            return value
+        }
+    }
+    else {
+        logger.debug("JSON config file not passed, checking properties or returning default for ${propertyName}")
+        boolean value = project.hasProperty(propertyName) ? project.property(propertyName).toBoolean() : defaultValue
+        return value
+    }
+}
+
+/**
+ * This will load a string property from a json file if it is set and then
+ * from the typical gradle property source and then a default
+ * @param propertyName the name of the property in the config or prop file
+ * @param defaultValue the supplied default
+ * @return the property value from one of the option sources
+ */
+String loadStringProp(String propertyName, String defaultValue) {
+
+    logger.debug("configFile is ${configFile}")
+    // if the configFile is present check there first
+    if (configFile != "none") {
+        logger.debug("JSON config file is present checking for property ${propertyName}")
+        Object json = new JsonSlurper().parseText(new File(configFile).text)
+        if (json.keySet().contains(propertyName)) {
+            logger.debug("Property: ${propertyName} found in JSON config file, setting to value")
+            return json[propertyName]
+        }
+        else {
+            logger.debug("Property: ${propertyName} not found in config checking properties or returning defualt")
+            String value = project.hasProperty(propertyName) ? project.property(propertyName) : defaultValue
+            return value
+        }
+    }
+    // else look for a property or return default
+    else {
+        logger.debug("JSON config file not passed, checking properties or returning defualt")
+        String value = project.hasProperty(propertyName) ? project.property(propertyName) : defaultValue
+        return value
+    }
+}
+
+/**
+ * This will get the profile of the build account
+ * @param configJson the account json config file
+ */
+String getBuildAccountProfile(Object configJson) {
+    for (account in configJson.accounts) {
+        if (account.buildAccount) {
+            return account.profileName
+        }
+    }
+}
+
+/**
+ * This will return the snapshot id for a given Ami
+ * @param amiId the ami id to get the snapshot id for
+ * @param profileName the credential profile to use
+ * @param region the aws region to use
+ */
+String getSnapshotId(String amiId, String profileName, String region) {
+    AmazonEC2 ec2 = getEc2Client(profileName, region)
+
+    Image ami = ec2.describeImages(new DescribeImagesRequest().withImageIds(amiId)).getImages().first()
+    return ami.getBlockDeviceMappings().first().getEbs().getSnapshotId()
+}
+
+/**
+ * This will share the AMI with all accounts in the accountCopy.json
+ * config file
+ * @param amiId the id of the ami to share
+ * @param configJson the json for the accountCopy.json
+ */
+void shareAmi(String amiId, Object configJson, String buildAccountProfile) {
+
+    logger.lifecycle("Sharing new ami ${amiId} with all accounts in config")
+
+    //Get the aws region from the config and get the ec2 client
+    AmazonEC2 ec2 = getEc2Client(buildAccountProfile, configJson.awsRegion)
+
+    // create a list of LaunchPermissions to give to the request
+    ArrayList<LaunchPermission> accountIdList = new ArrayList<LaunchPermission>()
+
+    // Get a list of account ids for the LaunchPermissions
+    for (account in configJson.accounts) {
+        if (!account.buildAccount) {
+            logger.lifecycle("Adding account ${account.accountName} with number ${account.accountNumber} to the share " +
+                    "list for ami ${amiId}")
+
+            accountIdList.add(new LaunchPermission().withUserId(account.accountNumber))
+        }
+    }
+
+    logger.lifecycle("Running modify image attribute request to share ami ${amiId}")
+    try {
+        ModifyImageAttributeRequest req = new ModifyImageAttributeRequest()
+                .withImageId(amiId)
+                .withLaunchPermission(new LaunchPermissionModifications()
+                .withAdd(accountIdList))
+
+        ModifyImageAttributeResult res = ec2.modifyImageAttribute(req)
+    } catch (Exception e){
+        throw new GradleException("There was an error updating image permissions ${e.toString()}")
+    }
+}
+
+/**
+ * This will grant the create volume permissions on the ami that
+ * are needed to create another ami from it
+ * @param snapshotId the snapshot id to modify
+ * @param configJson the account config json
+ */
+void grantCreateVolumePerms(String snapshotId, Object configJson, String buildAccountProfile) {
+
+    logger.lifecycle("Granting Create-Volume permissions for ami snapshot ${snapshotId}")
+
+    // Get the ec2 client
+    AmazonEC2 ec2 = getEc2Client(buildAccountProfile, configJson.awsRegion)
+
+    ArrayList<CreateVolumePermission> accountIdList = new ArrayList<CreateVolumePermission>()
+
+    // Get a list of account ids for CreateVolumePermissions
+    for (account in configJson.accounts) {
+        if (!account.buildAccount) {
+            logger.lifecycle("Adding account ${account.accountName} with number ${account.accountNumber} to the " +
+                    "create volume permission list for snapshot ${snapshotId}")
+
+            accountIdList.add(new CreateVolumePermission().withUserId(account.accountNumber))
+        }
+    }
+
+    logger.lifecycle("Running modify snapshot attribute request to snapshot ${snapshotId}")
+    try {
+        ModifySnapshotAttributeRequest req = new ModifySnapshotAttributeRequest()
+                .withSnapshotId(snapshotId)
+                .withCreateVolumePermission(new CreateVolumePermissionModifications()
+                .withAdd(accountIdList))
+
+        ModifySnapshotAttributeResult res = ec2.modifySnapshotAttribute(req)
+    } catch (Exception e) {
+        throw new GradleException("There was an error updating snapshot permissions ${e.toString()}")
+    }
+}
+
+/**
+ * This will copy the shared unecrypted AMI and encrypt it in
+ * the process of copying it to a new account
+ * @param unencryptedAmiId the AMI Id of the unencrypted AMI
+ * @param configJson the json for the accountCopy.json
+ */
+void copyAndEncryptAmi(String unencryptedAmiId, Object configJson, String amiName) {
+
+    logger.lifecycle("Starting copy and encryption process for all accounts in config")
+
+    // loop through all accounts to copy the temp Ami to an
+    // encrypted ami
+    for (account in configJson.accounts) {
+        logger.lifecycle("copying unencrypted temp ami ${unencryptedAmiId} for account ${account.accountName}")
+
+        // get ec2 client for that account
+        AmazonEC2 ec2 = getEc2Client(account.profileName, configJson.awsRegion)
+
+        try {
+            CopyImageRequest req = new CopyImageRequest()
+                                        .withSourceImageId(unencryptedAmiId)
+                                        .withSourceRegion(configJson.awsRegion)
+                                        .withEncrypted(true)
+                                        .withKmsKeyId(account.keyId)
+                                        .withName(amiName)
+                                        .withDescription(amiName)
+
+            CopyImageResult res = ec2.copyImage(req)
+
+            logger.lifecycle("Encrypted Image: ${res.getImageId()}")
+
+            logger.lifecycle("New encrypted ami for account ${account.accountName} is ${res.getImageId()}")
+        } catch (Exception e) {
+            throw new GradleException("There was an error copying and encrypting the ami ${e.toString()}")
+        }
+    }
+}
+
+/**
+ * This will clean up the unecrypted AMI leaving only the encrypted AMI
+ * @param unencryptedAmiId the AMI Id of the unencrypted AMI
+ * @param configJson the json for the accountCopy.json
+ */
+void cleanupUnencryptedAmi(String unencryptedAmiId, String buildAccountProfile, Object configJson) {
+
+    // get the ec2 client for the build account
+    AmazonEC2 ec2 = getEc2Client(buildAccountProfile, configJson.awsRegion)
+
+    logger.lifecycle("Deleting temp unecrypted image ${unencryptedAmiId}")
+    try {
+        DeregisterImageRequest req = new DeregisterImageRequest().withImageId(unencryptedAmiId)
+        DeregisterImageResult res = ec2.deregisterImage(req)
+    } catch (Exception e) {
+        throw new GradleException("There was an error deleting temp ami ${unencryptedAmiId}")
+    }
+}
+
+/**
+ * Gets the EC2 client using the supplied profile name and region
+ * @param profileName the credential profile to use
+ * @param region the region to use
+ * @return the ec2 client
+ */
+AmazonEC2 getEc2Client(String profileName, String region) {
+    AWSCredentials creds = getAwsCredentials(null, null, profileName)
+
+    return AmazonEC2ClientBuilder.standard()
+            .withCredentials(new AWSStaticCredentialsProvider(creds))
+            .withRegion(region)
+            .build()
+}
+
+/**
+ * Getting AWS credentials through either a specified profile or keys,
+ * or getting credentials from default locations
+ * @return aws credentials
+ */
+AWSCredentials getAwsCredentials(
+        String awsAccessKey=null,
+        String awsSecretKey=null,
+        String awsProfileName=null) {
+
+    if (awsProfileName != null) {
+        return new ProfileCredentialsProvider(awsProfileName).getCredentials()
+    }
+
+    else if (awsAccessKey != null && awsSecretKey != null) {
+        return new BasicAWSCredentials(awsAccessKey, awsSecretKey)
+    }
+
+    else {
+        // check for json config file for profile or keys
+        Object json
+        if (configFile != "none") {
+            logger.debug("JSON config file is present checking for profile or keys")
+            json = new JsonSlurper().parseText(new File(configFile).text)
+        }
+
+        /*
+       5 cases for getting credentials
+       1. if a profile name is specified in the json config file
+       2. if the accessKey and secretKey are in the json config file
+       3. if a profile name is specified in the properties file use creds from that profile
+       4. if the accessKey and secretKey are in the properties file use those credentials
+       5. used AWSs default credentials chain
+         */
+        if (configFile != "none" && json.keySet().contains("awsProfile")) {
+            logger.debug("loading profile from json config")
+            return new ProfileCredentialsProvider(json["awsProfile"]).getCredentials()
+        } else if (configFile != "none" && (json.keySet().contains("awsAccessKey") && json.keySet().contains("awsSecretKey"))) {
+            logger.debug("loading access and secret keys from json config")
+            return new BasicAWSCredentials(json["awsAccessKey"], json["awsSecretKey"])
+        } else if (project.hasProperty("awsProfileName")) {
+            logger.debug("using the AWS credential profile provider")
+            return new ProfileCredentialsProvider(project.property("awsProfileName")).getCredentials()
+        } else if (project.hasProperty("awsAccessKey") && project.hasProperty("awsSecretKey")) {
+            logger.debug("using the AWS credential basic provider")
+            return new BasicAWSCredentials(project.property("awsAccessKey"), project.property("awsSecretKey"))
+        } else {
+            logger.debug("using the AWS default provider chain")
+            return new DefaultAWSCredentialsProviderChain().getCredentials()
+        }
+    }
+}
+
+// Helper Classes //
+/**
+ * This will extend the LineOrientedOutputStream and
+ * overried the processLne method for some custom functionality
+ * it will both output to the screen (stdoutand stderr) and output to an ArrayList
+ * so that the AMI id can be pulled out after the build
+ */
+class LineOutput extends LineOrientedOutputStream {
+    String prefix
+    List lines
+
+    @Override
+    protected void processLine(String line) throws IOException {
+        lines.add(line)
+        println "${new Date().format('yyyy-MM-dd HH:mm:ss.SSS')} ${prefix} : ${line}"
+    }
+}
+
+
+
+
